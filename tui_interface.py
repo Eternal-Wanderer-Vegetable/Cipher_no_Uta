@@ -98,12 +98,35 @@ class CryptoApp(App):
 
             password = self.query_one("#password", Input).value
             
-            if not input_path or not output_path or not password:
-                self.log_box.write_line("❌ 错误: 请完整填写输入路径、输出路径和密码！")
+            # 校验输入文件和密码
+            if not input_path or not password:
+                self.log_box.write_line("❌ 错误: 请填写输入路径和密码！")
                 return
             if not os.path.exists(input_path):
-                self.log_box.write_line(f"❌ 错误: 输入路径文件不存在 -> {input_path}")
+                self.log_box.write_line(f"❌ 错误: 源文件不存在 -> {input_path}")
                 return
+
+            if is_encrypt:
+                # 提取主文件名。例如 "test.jpg" 会被拆分为 ("test", ".jpg")
+                dir_name = os.path.dirname(input_path)
+                base_name = os.path.basename(input_path)
+                name_without_ext, _ = os.path.splitext(base_name)
+                
+                # 1. 如果加密输出为空
+                if not output_path:
+                    # 默认输出和源文件在同一个文件夹下，文件名为 "主文件名.txt"
+                    output_path = os.path.join(dir_name, name_without_ext + ".txt")
+                # 2. 如果填写的只是个文件夹
+                elif os.path.isdir(output_path):
+                    output_path = os.path.join(output_path, name_without_ext + ".txt")
+            else:
+                # 1. 如果解密输出为空
+                if not output_path:
+                    # 默认输出到和密文同一个目录下
+                    output_path = os.path.dirname(input_path)
+                # 2. 如果解密输出不为空（不管它是文件夹还是指定了文件名），我们将这个路径丢给解密函数，内部会自动智能补齐原文件名
+                pass
+            # ---------------------------
 
             event.button.disabled = True
             self.progress_bar.progress = 0  # 进度归零

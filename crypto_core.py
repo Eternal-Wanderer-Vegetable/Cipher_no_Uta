@@ -1,8 +1,8 @@
 # crypto_core.py
+# crypto_core.py
 import os
 import gzip
 import base64
-import struct  # 用于将长度打包成 4 字节二进制
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
@@ -22,10 +22,8 @@ def derive_key(password: str, salt: bytes) -> bytes:
     )
     return kdf.derive(password.encode('utf-8'))
 
-# crypto_core.py 中的更新部分
-
 def encrypt_file(input_path: str, password: str, output_txt_path: str, progress_callback=None):
-    """支持进度回传的流式加密"""
+    """流式加密：打包[文件名元数据] + [压缩数据]"""
     if progress_callback:
         progress_callback(0, "🔑 正在初始化并派生密钥...")
         
@@ -33,7 +31,16 @@ def encrypt_file(input_path: str, password: str, output_txt_path: str, progress_
     key = derive_key(password, salt)
     aesgcm = AESGCM(key)
     
-    # 1. 压缩文件
+    # 1. 提取并打包源文件名元数据
+    # 例如 input_path = "E:/test_file/photo.jpg" -> original_name = "photo.jpg"
+    original_name = os.path.basename(input_path)
+    name_bytes = original_name.encode('utf-8')
+    name_len = len(name_bytes)
+    
+    if name_len > 255:
+        raise ValueError("源文件名过长，最大支持 255 字节！")
+        
+    # 2. 压缩文件数据
     if progress_callback:
         progress_callback(10, "📦 正在压缩源文件...")
         
@@ -41,25 +48,28 @@ def encrypt_file(input_path: str, password: str, output_txt_path: str, progress_
         plaintext = f_in.read()
         compressed = gzip.compress(plaintext)
     
-    total_len = len(compressed)
+    # 3. 将元数据和压缩数据打包在一起
+    # 打包格式：[1字节长度] + [文件名字节] + [压缩数据]
+    payload = bytes([name_len]) + name_bytes + compressed
+    
+    total_len = len(payload)
     CHUNK_SIZE = 512 * 1024 
     cursor = 0
     
-    # 2. 分块加密并写入
     if progress_callback:
         progress_callback(20, "🔐 开始分块加密...")
 
+    # 4. 分块加密写入
     with open(output_txt_path, 'w') as f_out:
         salt_b32 = base64.b32encode(salt).decode('ascii').lower().replace('=', '')
         f_out.write(salt_b32 + "\n")
         
         while cursor < total_len:
-            block = compressed[cursor:cursor+CHUNK_SIZE]
+            block = payload[cursor:cursor+CHUNK_SIZE]
             cursor += CHUNK_SIZE
             
-            # 计算当前进度 (从 20% 到 95%)
             percent = int(20 + (cursor / total_len) * 75)
-            percent = min(percent, 95) # 保留最后5%给写盘完毕
+            percent = min(percent, 95)
             
             if progress_callback:
                 progress_callback(percent, f"⚡ 正在加密分块: {cursor:,} / {total_len:,} 字节...")
@@ -75,17 +85,16 @@ def encrypt_file(input_path: str, password: str, output_txt_path: str, progress_
         progress_callback(100, "🎉 加密成功，数据流写入完毕！")
 
 
-def decrypt_file(input_txt_path: str, password: str, output_path: str, progress_callback=None):
-    """支持进度回传的流式解密"""
+def decrypt_file(input_txt_path: str, password: str, output_dir_or_file: str, progress_callback=None):
+    """流式解密：解密数据 → 解析出原文件名 → 流式解压输出"""
     if progress_callback:
         progress_callback(0, "🔑 正在读取并派生解密密钥...")
 
-    # 获取伪装文件的大小，用以预估解密进度
     total_chars = os.path.getsize(input_txt_path)
     read_chars = 0
 
     with open(input_txt_path, 'r') as f_in:
-        # 读取第一行：盐值
+        # 1. 读取第一行：盐值
         salt_line = f_in.readline()
         read_chars += len(salt_line)
         salt_line = salt_line.strip()
@@ -100,20 +109,20 @@ def decrypt_file(input_txt_path: str, password: str, output_path: str, progress_
         key = derive_key(password, salt)
         aesgcm = AESGCM(key)
         
-        compressed_data = bytearray()
+        payload_data = bytearray()
         
         if progress_callback:
             progress_callback(15, "🔓 开始逐行还原解密数据...")
 
-        # 2. 逐行读取加密块
+        # 2. 逐行解密读取
         for line in f_in:
             read_chars += len(line)
             block_b32 = line.strip()
             if not block_b32:
                 continue
                 
-            percent = int(15 + (read_chars / total_chars) * 70)
-            percent = min(percent, 85)
+            percent = int(15 + (read_chars / total_chars) * 65)
+            percent = min(percent, 80)
             
             if progress_callback:
                 progress_callback(percent, f"⚡ 正在还原并解密数据分块 ({percent}%)...")
@@ -127,15 +136,30 @@ def decrypt_file(input_txt_path: str, password: str, output_path: str, progress_
             ciphertext = combined[12:]
             
             decrypted_block = aesgcm.decrypt(nonce, ciphertext, None)
-            compressed_data.extend(decrypted_block)
+            payload_data.extend(decrypted_block)
             
-        # 3. 解压并写出文件
+        # 3. 解析元数据包 [1字节长度] + [文件名] + [压缩数据]
         if progress_callback:
-            progress_callback(90, "📦 正在解压缩还原原始文件...")
+            progress_callback(85, "📂 正在解析源文件名与元数据...")
+            
+        name_len = payload_data[0]
+        original_name = payload_data[1:1+name_len].decode('utf-8')
+        compressed_data = payload_data[1+name_len:]
+        
+        # 4. 智能判断输出路径
+        # 如果传入的是文件夹，或者为空，则自动使用原文件名
+        final_output_path = output_dir_or_file
+        if not final_output_path or os.path.isdir(final_output_path):
+            # 默认保存在当前文件夹（或传入的文件夹下），名字用原文件名
+            final_output_path = os.path.join(final_output_path, original_name)
+            
+        # 5. 解压并还原
+        if progress_callback:
+            progress_callback(90, f"📦 正在解压还原原始文件 -> {os.path.basename(final_output_path)}")
             
         plaintext = gzip.decompress(compressed_data)
-        with open(output_path, 'wb') as f_out:
+        with open(final_output_path, 'wb') as f_out:
             f_out.write(plaintext)
             
     if progress_callback:
-        progress_callback(100, "🎉 解密成功，原始文件已安全落地！")
+        progress_callback(100, f"🎉 解密成功！文件已还原为: {os.path.basename(final_output_path)}")
