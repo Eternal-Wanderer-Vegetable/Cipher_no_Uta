@@ -1,15 +1,15 @@
 # tui_interface.py
+# tui_interface.py
 import os
-import threading
 from textual.app import App, ComposeResult
 from textual.containers import Container
-from textual.widgets import Header, Footer, Button, Input, Label, RadioSet, RadioButton, Log
+from textual.widgets import Header, Footer, Button, Input, Label, RadioSet, RadioButton, Log, ProgressBar
 
-# 🚀 导入刚才拆分出去的核心加解密逻辑
+# 导入刚才修改完支持回调的核心算法
 from crypto_core import encrypt_file, decrypt_file
 
 class CryptoApp(App):
-    """一个美观直观的加密伪装传输工具 TUI 界面"""
+    """支持进度条和精细排查的高级 TUI 界面"""
     BINDINGS = [
         ("q", "quit", "退出程序"),
         ("ctrl+c", "quit", "退出")
@@ -17,20 +17,21 @@ class CryptoApp(App):
     
     CSS = """
     Screen { align: center middle; background: $background; }
-    #main-container { width: 80; height: 32; border: double $primary; padding: 1 2; background: $surface; }
+    #main-container { width: 80; height: 35; border: double $primary; padding: 1 2; background: $surface; }
     .title { text-align: center; width: 100%; text-style: bold; color: $accent; margin-bottom: 1; }
     .section-label { text-style: bold; margin-top: 1; color: $primary; }
     Input { margin-bottom: 1; border: tall $primary-darken-3; }
     Input:focus { border: tall $accent; }
     #radio-group { border: none; height: 3; margin-bottom: 1; }
     #btn-run { width: 100%; margin-top: 1; background: $accent; color: $text; text-style: bold; }
+    ProgressBar { margin-top: 1; margin-bottom: 1; width: 100%; }
     Log { height: 6; border: solid $primary-darken-2; background: $panel; margin-top: 1; }
     """
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Container(id="main-container"):
-            yield Label("🔐 加密伪装传输工具 v2.1", classes="title")
+            yield Label("🔐 加密伪装传输工具 v2.2", classes="title")
             
             yield Label("📁 请选择操作模式:", classes="section-label")
             with RadioSet(id="radio-group"):
@@ -47,11 +48,16 @@ class CryptoApp(App):
             yield Input(placeholder="请输入强密码...", password=True, id="password")
             
             yield Button("开始执行任务 ⚡", id="btn-run", variant="primary")
+            
+            # 🚀 进度条组件（初始化为不可见，或者总进度 100）
+            yield ProgressBar(total=100, show_eta=False, id="crypto-progress")
+            
             yield Log(id="log-box")
         yield Footer()
 
     def on_mount(self) -> None:
         self.log_box = self.query_one("#log-box", Log)
+        self.progress_bar = self.query_one("#crypto-progress", ProgressBar)
         self.log_box.write_line("系统就绪。请填写上方参数，然后点击[开始执行]按钮。")
 
     def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
@@ -64,11 +70,32 @@ class CryptoApp(App):
             input_widget.placeholder = "请输入或拖入伪装文本路径... (如: secret.txt)"
             output_widget.placeholder = "请输入输出还原文件路径... (如: photo_restore.jpg)"
 
+    # ============ 🚀 线程安全的多线程消息通信 ============
+    def update_ui_progress(self, percent: int, message: str) -> None:
+        """这个方法保证在 Textual 主事件循环线程内执行，绝对不会卡死！"""
+        self.log_box.write_line(message)
+        self.progress_bar.progress = percent  # 直接修改进度条比例
+
+    def enable_ui_after_job(self) -> None:
+        """解密/加密结束，恢复按钮可点"""
+        self.query_one("#btn-run", Button).disabled = False
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-run":
             is_encrypt = self.query_one("#mode-encrypt", RadioButton).value
             input_path = self.query_one("#input-path", Input).value.strip()
             output_path = self.query_one("#output-path", Input).value.strip()
+
+            # ---- 🚀 新增：智能路径补全逻辑 ----
+            if os.path.isdir(output_path):
+            # 如果是加密模式，自动在文件夹后追加 "secret.txt"
+                if is_encrypt:
+                    output_path = os.path.join(output_path, "secret.txt")
+                # 如果是解密模式，自动在文件夹后追加 "restored_file" (用户可以之后自己改后缀)
+                else:
+                    output_path = os.path.join(output_path, "restored_file")
+            # ---------------------------------
+
             password = self.query_one("#password", Input).value
             
             if not input_path or not output_path or not password:
@@ -79,24 +106,24 @@ class CryptoApp(App):
                 return
 
             event.button.disabled = True
-            self.log_box.write_line("⏳ 任务开始，正在后台处理中...")
-            
-            def worker():
+            self.progress_bar.progress = 0  # 进度归零
+            self.log_box.write_line("⏳ 任务正式启动...")
+
+            # 🚀 创建进度回调桥梁
+            def tui_callback(percent, message):
+                # 核心机制：利用 call_from_thread 把工作进度打包发送到主线程安全的方法中更新
+                self.app.call_from_thread(self.update_ui_progress, percent, message)
+
+            def do_crypto_work():
                 try:
                     if is_encrypt:
-                        self.log_box.write_line(f"🔐 正在加密: {input_path} ...")
-                        encrypt_file(input_path, password, output_path)
-                        self.log_box.write_line(f"✓ 加密成功！已保存至: {output_path}")
+                        encrypt_file(input_path, password, output_path, progress_callback=tui_callback)
                     else:
-                        self.log_box.write_line(f"🔓 正在解密: {input_path} ...")
-                        decrypt_file(input_path, password, output_path)
-                        self.log_box.write_line(f"✓ 解密成功！已保存至: {output_path}")
+                        decrypt_file(input_path, password, output_path, progress_callback=tui_callback)
                 except Exception as e:
-                    self.log_box.write_line(f"❌ 操作失败: {str(e)}")
+                    self.app.call_from_thread(self.update_ui_progress, 0, f"❌ 操作崩溃: {str(e)}")
                 finally:
-                    self.app.call_from_thread(self.enable_run_button)
+                    self.app.call_from_thread(self.enable_ui_after_job)
 
-            threading.Thread(target=worker, daemon=True).start()
-
-    def enable_run_button(self):
-        self.query_one("#btn-run", Button).disabled = False
+            # 启动 Textual 安全的工作线程
+            self.run_worker(do_crypto_work, thread=True)

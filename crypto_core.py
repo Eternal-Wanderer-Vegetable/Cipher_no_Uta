@@ -2,19 +2,17 @@
 import os
 import gzip
 import base64
-import tempfile
+import struct  # 用于将长度打包成 4 字节二进制
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
-# ============ 配置 ============
-SALT_SIZE = 16          # 盐值大小（字节）
-KEY_LENGTH = 32         # AES-256 密钥长度
-ITERATIONS = 100000     # PBKDF2 迭代次数
+SALT_SIZE = 16          
+KEY_LENGTH = 32         
+ITERATIONS = 100000     
 
 def derive_key(password: str, salt: bytes) -> bytes:
-    """从密码和盐值派生出 AES 密钥"""
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=KEY_LENGTH,
@@ -24,91 +22,120 @@ def derive_key(password: str, salt: bytes) -> bytes:
     )
     return kdf.derive(password.encode('utf-8'))
 
-def encrypt_file(input_path: str, password: str, output_txt_path: str):
-    """流式加密文件：流式压缩 → 分块加密 → 流式 Base32 编码输出"""
+# crypto_core.py 中的更新部分
+
+def encrypt_file(input_path: str, password: str, output_txt_path: str, progress_callback=None):
+    """支持进度回传的流式加密"""
+    if progress_callback:
+        progress_callback(0, "🔑 正在初始化并派生密钥...")
+        
     salt = os.urandom(SALT_SIZE)
     key = derive_key(password, salt)
-    
-    temp_compressed = tempfile.TemporaryFile()
-    
-    # 1. 流式 Gzip 压缩
-    CHUNK_SIZE = 64 * 1024
-    with open(input_path, 'rb') as f_in:
-        with gzip.GzipFile(fileobj=temp_compressed, mode='wb') as f_zip:
-            while True:
-                chunk = f_in.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                f_zip.write(chunk)
-    
-    temp_compressed.seek(0)
-    
-    # 2. 开始分块加密并进行 Base32 写入
     aesgcm = AESGCM(key)
     
+    # 1. 压缩文件
+    if progress_callback:
+        progress_callback(10, "📦 正在压缩源文件...")
+        
+    with open(input_path, 'rb') as f_in:
+        plaintext = f_in.read()
+        compressed = gzip.compress(plaintext)
+    
+    total_len = len(compressed)
+    CHUNK_SIZE = 512 * 1024 
+    cursor = 0
+    
+    # 2. 分块加密并写入
+    if progress_callback:
+        progress_callback(20, "🔐 开始分块加密...")
+
     with open(output_txt_path, 'w') as f_out:
         salt_b32 = base64.b32encode(salt).decode('ascii').lower().replace('=', '')
-        f_out.write(salt_b32)
+        f_out.write(salt_b32 + "\n")
         
-        ENCRYPT_CHUNK_SIZE = 1024 * 1024 
-        while True:
-            data_block = temp_compressed.read(ENCRYPT_CHUNK_SIZE)
-            if not data_block:
-                break
-                
-            block_nonce = os.urandom(12)
-            encrypted_block = aesgcm.encrypt(block_nonce, data_block, None)
-            combined_block = block_nonce + encrypted_block
+        while cursor < total_len:
+            block = compressed[cursor:cursor+CHUNK_SIZE]
+            cursor += CHUNK_SIZE
             
-            block_b32 = base64.b32encode(combined_block).decode('ascii').lower().replace('=', '')
-            f_out.write(block_b32)
+            # 计算当前进度 (从 20% 到 95%)
+            percent = int(20 + (cursor / total_len) * 75)
+            percent = min(percent, 95) # 保留最后5%给写盘完毕
             
-    temp_compressed.close()
+            if progress_callback:
+                progress_callback(percent, f"⚡ 正在加密分块: {cursor:,} / {total_len:,} 字节...")
 
-def decrypt_file(input_txt_path: str, password: str, output_path: str):
-    """流式解密文件：流式读取文本 → 逐块 Base32 解码 → 逐块 AES-GCM 解密 → 流式解压输出"""
-    B32_SALT_LEN = 26
-    B32_BLOCK_LEN = 1677768 
-    
+            nonce = os.urandom(12)
+            ciphertext = aesgcm.encrypt(nonce, block, None)
+            combined = nonce + ciphertext
+            
+            block_b32 = base64.b32encode(combined).decode('ascii').lower().replace('=', '')
+            f_out.write(block_b32 + "\n")
+            
+    if progress_callback:
+        progress_callback(100, "🎉 加密成功，数据流写入完毕！")
+
+
+def decrypt_file(input_txt_path: str, password: str, output_path: str, progress_callback=None):
+    """支持进度回传的流式解密"""
+    if progress_callback:
+        progress_callback(0, "🔑 正在读取并派生解密密钥...")
+
+    # 获取伪装文件的大小，用以预估解密进度
+    total_chars = os.path.getsize(input_txt_path)
+    read_chars = 0
+
     with open(input_txt_path, 'r') as f_in:
-        salt_b32 = f_in.read(B32_SALT_LEN)
-        if not salt_b32:
+        # 读取第一行：盐值
+        salt_line = f_in.readline()
+        read_chars += len(salt_line)
+        salt_line = salt_line.strip()
+        if not salt_line:
             raise ValueError("文件损坏，无法读取盐值")
             
-        salt_b32_upper = salt_b32.upper() + "=="
+        salt_b32_upper = salt_line.upper()
+        if len(salt_b32_upper) % 8:
+            salt_b32_upper += '=' * (8 - (len(salt_b32_upper) % 8))
         salt = base64.b32decode(salt_b32_upper)
         
         key = derive_key(password, salt)
         aesgcm = AESGCM(key)
         
-        temp_decrypted = tempfile.TemporaryFile()
+        compressed_data = bytearray()
         
-        while True:
-            block_b32 = f_in.read(B32_BLOCK_LEN)
+        if progress_callback:
+            progress_callback(15, "🔓 开始逐行还原解密数据...")
+
+        # 2. 逐行读取加密块
+        for line in f_in:
+            read_chars += len(line)
+            block_b32 = line.strip()
             if not block_b32:
-                break
+                continue
                 
+            percent = int(15 + (read_chars / total_chars) * 70)
+            percent = min(percent, 85)
+            
+            if progress_callback:
+                progress_callback(percent, f"⚡ 正在还原并解密数据分块 ({percent}%)...")
+
             block_b32_upper = block_b32.upper()
-            missing_padding = len(block_b32_upper) % 8
-            if missing_padding:
-                block_b32_upper += '=' * (8 - missing_padding)
+            if len(block_b32_upper) % 8:
+                block_b32_upper += '=' * (8 - (len(block_b32_upper) % 8))
                 
-            combined_block = base64.b32decode(block_b32_upper)
-            nonce = combined_block[:12]
-            ciphertext = combined_block[12:]
+            combined = base64.b32decode(block_b32_upper)
+            nonce = combined[:12]
+            ciphertext = combined[12:]
             
             decrypted_block = aesgcm.decrypt(nonce, ciphertext, None)
-            temp_decrypted.write(decrypted_block)
+            compressed_data.extend(decrypted_block)
             
-        temp_decrypted.seek(0)
-        
-        with gzip.GzipFile(fileobj=temp_decrypted, mode='rb') as f_zip:
-            with open(output_path, 'wb') as f_out:
-                CHUNK_SIZE = 64 * 1024
-                while True:
-                    chunk = f_zip.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    f_out.write(chunk)
-                    
-        temp_decrypted.close()
+        # 3. 解压并写出文件
+        if progress_callback:
+            progress_callback(90, "📦 正在解压缩还原原始文件...")
+            
+        plaintext = gzip.decompress(compressed_data)
+        with open(output_path, 'wb') as f_out:
+            f_out.write(plaintext)
+            
+    if progress_callback:
+        progress_callback(100, "🎉 解密成功，原始文件已安全落地！")
