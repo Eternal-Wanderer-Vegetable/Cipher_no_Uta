@@ -25,6 +25,8 @@ class CryptoApp(App):
     #radio-group { border: none; height: 3; margin-bottom: 1; }
     #btn-run { width: 100%; margin-top: 1; background: $accent; color: $text; text-style: bold; }
     ProgressBar { margin-top: 1; margin-bottom: 1; width: 100%; }
+    /* 强制进度条内部的容器占满全部可用空间 */
+    ProgressBar > Bar { width: 1fr; }
     Log { height: 6; border: solid $primary-darken-2; background: $panel; margin-top: 1; }
     """
 
@@ -106,6 +108,7 @@ class CryptoApp(App):
                 self.log_box.write_line(f"❌ 错误: 源文件不存在 -> {input_path}")
                 return
 
+            # ---- 🚀 智能默认路径逻辑 ----
             if is_encrypt:
                 # 提取主文件名。例如 "test.jpg" 会被拆分为 ("test", ".jpg")
                 dir_name = os.path.dirname(input_path)
@@ -114,11 +117,15 @@ class CryptoApp(App):
                 
                 # 1. 如果加密输出为空
                 if not output_path:
-                    # 默认输出和源文件在同一个文件夹下，文件名为 "主文件名.txt"
                     output_path = os.path.join(dir_name, name_without_ext + ".txt")
                 # 2. 如果填写的只是个文件夹
                 elif os.path.isdir(output_path):
                     output_path = os.path.join(output_path, name_without_ext + ".txt")
+                # 🚀 3. 新增：如果用户手动写了文件名，但写错了后缀（比如 output.png），强行纠正为 .txt
+                else:
+                    user_base, user_ext = os.path.splitext(output_path)
+                    if user_ext.lower() != ".txt":
+                        output_path = user_base + ".txt"
             else:
                 # 1. 如果解密输出为空
                 if not output_path:

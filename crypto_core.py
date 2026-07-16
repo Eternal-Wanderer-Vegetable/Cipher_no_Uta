@@ -146,12 +146,25 @@ def decrypt_file(input_txt_path: str, password: str, output_dir_or_file: str, pr
         original_name = payload_data[1:1+name_len].decode('utf-8')
         compressed_data = payload_data[1+name_len:]
         
-        # 4. 智能判断输出路径
-        # 如果传入的是文件夹，或者为空，则自动使用原文件名
+        # 4. 智能判断与纠正输出路径
+        # 提取原文件的后缀名（例如：".jpg"）
+        _, orig_ext = os.path.splitext(original_name)
+        
         final_output_path = output_dir_or_file
+        
+        # 情况 A：用户没填，或者填的是一个已存在的文件夹
         if not final_output_path or os.path.isdir(final_output_path):
-            # 默认保存在当前文件夹（或传入的文件夹下），名字用原文件名
-            final_output_path = os.path.join(final_output_path, original_name)
+            final_output_path = os.path.join(final_output_path or "", original_name)
+        
+        # 情况 B：用户指定了具体的文件路径，但我们需要检查其后缀
+        else:
+            # 拆分用户指定的路径，获取用户写的后缀
+            user_base, user_ext = os.path.splitext(final_output_path)
+            
+            # 如果用户没写后缀，或者写的后缀与原文件后缀（不区分大小写）不一致
+            if not user_ext or user_ext.lower() != orig_ext.lower():
+                # 智能纠正：强行保留用户起的文件名，但把后缀换成正确的原文件后缀
+                final_output_path = user_base + orig_ext
             
         # 5. 解压并还原
         if progress_callback:
